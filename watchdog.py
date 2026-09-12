@@ -85,17 +85,28 @@ def host_up(timeout=12):
 
 def reboot_instance():
     import oci
+    import tempfile
 
-    config = {
-        "tenancy": os.environ["OCI_TENANCY"],
-        "user": os.environ["OCI_USER"],
-        "fingerprint": os.environ["OCI_FINGERPRINT"],
-        "key_file_content": os.environ["OCI_KEY"],
-        "region": os.environ["OCI_REGION"],
-    }
-    compute = oci.core.ComputeClient(config)
-    resp = compute.instance_action(instance_id=os.environ["OCI_INSTANCE_ID"], action="RESET")
-    return resp.status
+    key_pem = os.environ["OCI_KEY"]
+    fd, key_path = tempfile.mkstemp(prefix="oci_key_", suffix=".pem")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(key_pem)
+    try:
+        config = {
+            "tenancy": os.environ["OCI_TENANCY"],
+            "user": os.environ["OCI_USER"],
+            "fingerprint": os.environ["OCI_FINGERPRINT"],
+            "key_file": key_path,
+            "region": os.environ["OCI_REGION"],
+        }
+        compute = oci.core.ComputeClient(config)
+        resp = compute.instance_action(instance_id=os.environ["OCI_INSTANCE_ID"], action="RESET")
+        return resp.status
+    finally:
+        try:
+            os.remove(key_path)
+        except OSError:
+            pass
 
 
 def main():
