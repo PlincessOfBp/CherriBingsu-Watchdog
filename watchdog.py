@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import json
 import os
 import socket
@@ -8,50 +9,68 @@ import urllib.request
 
 HOST = os.environ.get("OCI_HOST", "193.123.162.8")
 PORT = int(os.environ.get("PORT", "22"))
-VAR_NAME = "FAIL_COUNT"
+STATE_PATH = "state.json"
 RESTART_AFTER = int(os.environ.get("RESTART_AFTER", "3"))
 REPO = os.environ["GITHUB_REPOSITORY"]
 TOKEN = os.environ["GITHUB_TOKEN"]
 
 
-def _req(url, method="GET", value=None):
+def _api(url, method="GET", body=None):
     req = urllib.request.Request("https://api.github.com" + url, method=method)
     req.add_header("Authorization", "Bearer " + TOKEN)
     req.add_header("Accept", "application/vnd.github+json")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
-    body = None
-    if value is not None:
+    data = None
+    if body is not None:
         req.add_header("Content-Type", "application/json")
-        body = json.dumps(value).encode()
-    with urllib.request.urlopen(req, data=body, timeout=30) as r:
-        return r.status, r.read()
-
-
-def get_fail_count():
+        data = json.dumps(body).encode()
     try:
-        status, data = _req("/repos/%s/actions/variables/%s" % (REPO, VAR_NAME))
-        return int(json.loads(data)["value"])
-    except urllib.error.HTTPError:
-        return 0
-    except Exception:
-        return 0
-
-
-def set_fail_count(n):
-    try:
-        _req(
-            "/repos/%s/actions/variables/%s" % (REPO, VAR_NAME),
-            "PATCH",
-            {"name": VAR_NAME, "value": str(n)},
-        )
+        with urllib.request.urlopen(req, data=data, timeout=30) as r:
+            return r.status, json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            try:
-                _req("/repos/%s/actions/variables" % REPO, "POST", {"name": VAR_NAME, "value": str(n)})
-            except Exception as ex:
-                print("[watchdog] variable create failed: %s" % ex)
-        else:
-            print("[watchdog] variable update failed: %s" % e)
+        try:
+            message = e.read().decode()
+        except Exception:
+            message = ""
+        print("[watchdog] API %s %s -> HTTP %s %s" % (method, url.split("/repos/")[-1], e.code, message[:160]))
+        return e.code, {}
+
+
+def _read_state():
+    code, res = _api("/repos/%s/contents/%s" % (REPO, STATE_PATH))
+    if code == 200:
+        try:
+            content = json.loads(base64.b64decode(res["content"]).decode("utf-8"))
+            return int(content.get("fail_count", 0)), res["sha"]
+        except Exception as e:
+            print("[watchdog] state decode error: %s" % e)
+    return 0, None
+
+
+def _write_state(fail_count, sha):
+    for _attempt in range(3):
+        try:
+            body = {
+                "message": "watchdog state: fail_count=%d" % fail_count,
+                "content": base64.b64encode(
+                    json.dumps({"fail_count": fail_count}).encode()
+                ).decode(),
+                "branch": "main",
+            }
+            if sha:
+                body["sha"] = sha
+            code, res = _api("/repos/%s/contents/%s" % (REPO, STATE_PATH), "PUT", body)
+            if code in (200, 201):
+                return True
+            if code == 409:
+                stored, sha = _read_state()
+                _ = stored
+                continue
+            return False
+        except Exception as e:
+            print("[watchdog] state write error: %s" % e)
+            return False
+    return False
 
 
 def host_up(timeout=12):
@@ -80,19 +99,24 @@ def reboot_instance():
 
 
 def main():
-    if host_up():
-        set_fail_count(0)
-        print("[watchdog] OK: SSH banner received from %s:%s (fail count reset)" % (HOST, PORT))
+    up = host_up()
+    stored, sha = _read_state()
+    if up:
+        if stored != 0:
+            _write_state(0, sha)
+            print("[watchdog] SSH OK: fail count reset to 0")
+        else:
+            print("[watchdog] OK: SSH banner received from %s:%s" % (HOST, PORT))
         return 0
-    count = get_fail_count() + 1
+    count = stored + 1
     print("[watchdog] UNREACHABLE: consecutive failures = %d (restart threshold=%d)" % (count, RESTART_AFTER))
     if count < RESTART_AFTER:
-        set_fail_count(count)
+        _write_state(count, sha)
         return 0
     try:
         status = reboot_instance()
         print("[watchdog] OCI instance RESET initiated (status=%s)" % status)
-        set_fail_count(0)
+        _write_state(0, sha)
     except Exception as e:
         print("[watchdog] REBOOT FAILED: %s" % e)
         return 1
